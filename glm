@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+glm-quota — GLM Coding Plan 配额查询 + 分档提醒（手机 Bark + Mac 通知中心）
+
+用法:
+  glm-quota            查询当前配额（5小时 / 每周 / MCP 每月）
+  glm-quota --json     输出原始 JSON
+  glm-quota --watch    监控模式：按阈值分档推送（每档每周期一次，手机+Mac 双通道）
+                       推送前提：5小时 + 每周两个额度都可用（任一已满即静默挂起，
+                       等两者都可用时再推，避免"说能干活其实干不了"的误导推送）
+  glm-quota --watch --threshold 50,95   多档提醒（默认 50,95）
+  glm-quota --watch --threshold 80      单档提醒
+  glm-quota --reset-state   清除已推送状态（调试用）
+
+API Key 读取顺序: --api-key > $GLM_API_KEY > ~/.claude/glm-router/upstream.key > ~/.claude/settings.json
+Bark Key 读取顺序: --bark-key > $BARK_KEY > ~/.glm-quota.env（未配置则仅 Mac 通知中心）
+配置文件 ~/.glm-quota.env（dotenv 格式，可选）:
+  BARK_KEY=你的Bark推送key
+  GLM_API_KEY=你的智谱APIKey   （可选，优先级低于进程环境变量）
+"""
+import json
+import os
+import ssl
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+API_URL = "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
+KEY_FILE = os.path.expanduser("~/.claude/settings.json")
+ROUTER_KEY_FILE = os.path.expanduser("~/.claude/glm-router/upstream.key")
+STATE_FILE = os.path.expanduser("~/.glm-quota-state.json")
+ENV_FILE = os.path.expanduser("~/.glm-quota.env")  # dotenv 格式: BARK_KEY=xxx
+DEFAULT_THRESHOLD = "50,95"  # 50% 温和预警 + 95% 紧急提醒
+
+C_RESET, C_RED, C_YELLOW, C_GREEN, C_DIM = "\033[0m", "\033[31m", "\033[33m", "\033[32m", "\033[2m"
+
+
+def make_ssl_context():
+    """兼容各 Python 发行版的 CA 证书探测：certifi → macOS 系统证书 → 默认。
+    解决 python.org 发行版默认找不到根证书导致 CERTIFICATE_VERIFY_FAILED 的问题。"""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        pass
+    for cafile in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+        if os.path.exists(cafile):
+            return ssl.create_default_context(cafile=cafile)
+    return ssl.create_default_context()
+
+
+SSL_CTX = make_ssl_context()
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def load_dotenv(path=ENV_FILE):
+    """极简 .env 加载：KEY=VALUE 行注入 os.environ（不覆盖已存在的环境变量）"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except FileNotFoundError:
+        pass
+
+
+def load_api_key(cli_key):
+    if cli_key:
+        return cli_key
+    env = os.environ.get("GLM_API_KEY") or os.environ.get("ZHIPU_API_KEY")
+    if env:
+        return env
+    # glm-router 架构下 settings.json 存的是本地代理 token（只对 127.0.0.1:8788 有效），
+    # 真实 Coding Plan key 在 ~/.claude/glm-router/upstream.key，优先读它。
+    for key_file in (ROUTER_KEY_FILE, KEY_FILE):
+        try:
+            with open(key_file, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            if key_file == KEY_FILE:
+                token = json.loads(text)["env"]["ANTHROPIC_AUTH_TOKEN"]
+            else:
+                token = text
+            if token:
+                return token
+        except Exception:
+            continue
+    eprint("错误: 找不到 API Key（--api-key / $GLM_API_KEY / ~/.claude/glm-router/upstream.key / ~/.claude/settings.json 均未命中）")
+    sys.exit(1)
+
+
+def fetch_quota(api_key):
+    req = urllib.request.Request(API_URL, headers={
+        "Authorization": api_key,
+        "Content-Type": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def parse_usage(data):
+    """返回 {level, h5, week, mcp}，h5/week/mcp 为 dict 或 None"""
+    limits = data["data"]["limits"]
+    tokens = sorted(
+        [l for l in limits if l["type"] == "TOKENS_LIMIT"],
+        key=lambda l: l.get("nextResetTime") or 0,
+    )
+    mcp = next((l for l in limits if l["type"] == "TIME_LIMIT"), None)
+    return {
+        "level": data["data"].get("level", "unknown").upper(),
+        "h5": tokens[0] if len(tokens) > 0 else None,
+        "week": tokens[1] if len(tokens) > 1 else None,
+        "mcp": mcp,
+    }
+
+
+def fmt_countdown(ts_ms, now_ms=None):
+    if not ts_ms:
+        return "未知"
+    now_ms = now_ms or int(time.time() * 1000)
+    diff = ts_ms - now_ms
+    if diff <= 0:
+        return "即将重置"
+    mins = diff // 60000
+    if mins >= 1440:
+        return f"{mins // 1440}天{(mins % 1440) // 60}小时后"
+    if mins >= 60:
+        return f"{mins // 60}小时{mins % 60}分钟后"
+    return f"{mins}分钟后"
+
+
+def bar(pct, width=22):
+    filled = round(width * pct / 100)
+    color = C_RED if pct >= 95 else C_YELLOW if pct >= 80 else C_GREEN
+    return f"{color}{'█' * filled}{'░' * (width - filled)}{C_RESET} {pct:>3}%"
+
+
+def fmt_reset_time(ts_ms):
+    if not ts_ms:
+        return "?"
+    return time.strftime("%H:%M", time.localtime(ts_ms / 1000))
+
+
+def print_report(u):
+    now_ms = int(time.time() * 1000)
+    print(f"GLM Coding Plan · {u['level']} 套餐 · {time.strftime('%Y-%m-%d %H:%M')}")
+    print()
+    if u["h5"]:
+        h = u["h5"]
+        print(f"  5小时额度  {bar(h['percentage'])}")
+        print(f"  {C_DIM}└ 重置 {fmt_reset_time(h.get('nextResetTime'))}（{fmt_countdown(h.get('nextResetTime'), now_ms)}）{C_RESET}")
+    if u["week"]:
+        w = u["week"]
+        print(f"  每周额度   {bar(w['percentage'])}")
+        print(f"  {C_DIM}└ 重置 {fmt_countdown(w.get('nextResetTime'), now_ms)}{C_RESET}")
+    if u["mcp"]:
+        m = u["mcp"]
+        used, total = m.get("currentValue", 0), m.get("usage", 0)
+        print(f"  MCP每月    {C_DIM}{used}/{total} 次{C_RESET}")
+
+
+def bark_push(bark_key, title, body, group="GLM配额"):
+    if not bark_key:
+        eprint("未配置 Bark key（--bark-key / $BARK_KEY / ~/.glm-quota.env），跳过手机推送")
+        return False
+    url = f"https://api.day.app/{bark_key}/{urllib.parse.quote(title)}/{urllib.parse.quote(body)}?group={urllib.parse.quote(group)}&sound=bell"
+    try:
+        urllib.request.urlopen(urllib.request.Request(url), timeout=10, context=SSL_CTX)
+        return True
+    except Exception as e:
+        eprint(f"Bark 推送失败: {e}")
+        return False
+
+
+def mac_notify(title, body, sound=False):
+    """macOS 通知中心弹窗（osascript）"""
+    esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'display notification "{esc(body)}" with title "{esc(title)}" subtitle "GLM Coding Plan"'
+        + (' sound name "Bell"' if sound else "")
+    )
+    try:
+        import subprocess
+        subprocess.run(["osascript", "-e", script], timeout=10,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception as e:
+        eprint(f"Mac 通知失败: {e}")
+        return False
+
+
+def notify_all(bark_key, title, body, sound=False):
+    """双通道推送：手机 Bark + Mac 通知中心，任一成功即算成功"""
+    ok_bark = bark_push(bark_key, title, body)
+    ok_mac = mac_notify(title, body, sound=sound)
+    return ok_bark or ok_mac
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+
+def resolve_thresholds(raw):
+    """'95' → (95,)；'50,95' → (50, 95)；'90-95' → (90, 95)；去重升序"""
+    parts = []
+    for seg in raw.replace("，", ",").replace("-", ",").split(","):
+        seg = seg.strip()
+        if not seg:
+            continue
+        n = int(seg)
+        if not 1 <= n <= 100:
+            raise ValueError(f"阈值需在 1-100 之间: {n}")
+        if n not in parts:
+            parts.append(n)
+    if not parts:
+        raise ValueError("至少提供一个阈值")
+    return tuple(sorted(parts))
+
+
+def watch(api_key, thresholds, bark_key, data=None):
+    """监控逻辑；data 传入则复用，否则自行查询（launchd 模式）
+    thresholds: 升序阈值元组，如 (50, 95)。每档每周期只推一次。"""
+    if data is None:
+        try:
+            data = fetch_quota(api_key)
+        except Exception as e:
+            eprint(f"查询失败: {e}")
+            return  # 静默退出，等 launchd 下个周期重试
+        if not data.get("success"):
+            eprint(f"API 返回失败: {data.get('msg')}")
+            return
+    u = parse_usage(data)
+    if not u["h5"]:
+        return
+    pct = u["h5"]["percentage"]
+    reset_ts = u["h5"].get("nextResetTime")
+    week_pct = u["week"]["percentage"] if u["week"] else 0
+    week_ok = week_pct < 100  # 本周额度可用 = 未满（已满时根本干不了活，不推任何通知）
+    state = load_state()
+    alerts = state.get("alerts", {})  # {threshold: alerted_reset_ts}
+    pending = state.get("pending_recovery", False)  # 恢复通知挂起标记
+
+    if any(pct >= t for t in thresholds):
+        if not week_ok:
+            # 本周额度已满 → 推预警也没意义（照样干不了活）；不记状态，
+            # 等周额度重置后本周期内阈值仍命中，届时正常推送
+            print(f"5小时 {pct}% 达阈值，但本周额度已满（{week_pct}%），暂不推送")
+            return
+        pushed_any = False
+        for t in thresholds:
+            if pct >= t and alerts.get(str(t)) != reset_ts:  # 该档本周期未推送
+                week_info = f"｜每周 {week_pct}%" if u["week"] else ""
+                urgency = "⚠️" if t == thresholds[-1] else "📊"
+                title = f"{urgency} GLM 5小时配额已用 {pct}%"
+                body = f"超过 {t}%{week_info}，{fmt_countdown(reset_ts)}重置"
+                if notify_all(bark_key, title, body, sound=(t == thresholds[-1])):
+                    alerts[str(t)] = reset_ts
+                    pushed_any = True
+                    print(f"已推送[{t}%档]: {title}")
+                else:
+                    print(f"推送失败（下个周期重试）[{t}%档]: {title}")
+        if pushed_any:
+            state["alerts"] = alerts
+            state.pop("pending_recovery", None)
+            save_state(state)
+        elif all(pct < t or alerts.get(str(t)) == reset_ts for t in thresholds):
+            print(f"本周期各档已推送过，跳过: 5小时 {pct}%")
+    else:
+        week_info = f"5小时 {pct}% · 每周 {week_pct}%" if u["week"] else f"5小时 {pct}%"
+        if pending:
+            # 上次 5小时重置时周额度还满着，恢复通知被挂起，等周额度恢复再推
+            if week_ok:
+                save_state({})
+                notify_all(bark_key, "GLM 周额度已重置", f"{week_info}，可以继续干活了")
+                print("周额度恢复并通知")
+            else:
+                print(f"恢复通知挂起中: {week_info}（本周额度仍满，暂不推送）")
+            return
+        old_alerted = [ts for ts in alerts.values()]
+        if old_alerted and all(ts != reset_ts for ts in old_alerted):
+            # 5小时新周期已开始且额度回落
+            if week_ok:
+                save_state({})
+                notify_all(bark_key, "GLM 配额已重置", f"{week_info}，可以继续干活了")
+                print("配额已重置并通知")
+            else:
+                # 5小时重置了但本周额度仍满 → 挂起恢复通知，等周额度重置后再推
+                state["alerts"] = {}
+                state["pending_recovery"] = True
+                save_state(state)
+                print(f"5小时额度已重置，但本周额度已满（{week_pct}%），恢复通知挂起")
+        else:
+            print(f"监控正常: {week_info}（阈值 {','.join(map(str, thresholds))}%）")
+
+
+def main():
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return
+    if "--reset-state" in args:
+        save_state({})
+        print("状态已清除")
+        return
+
+    api_key = None
+    thresholds_raw = str(DEFAULT_THRESHOLD)
+    bark_key = None
+    load_dotenv()  # ~/.glm-quota.env → 环境变量（不覆盖已有）
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--api-key":
+            api_key = args[i + 1]; i += 2
+        elif a == "--threshold":
+            thresholds_raw = args[i + 1]; i += 2
+        elif a == "--bark-key":
+            bark_key = args[i + 1]; i += 2
+        elif a in ("--watch", "--json"):
+            i += 1
+        else:
+            eprint(f"未知参数: {a}（--help 查看用法）")
+            sys.exit(1); i += 1
+    try:
+        thresholds = resolve_thresholds(thresholds_raw)
+    except ValueError as e:
+        eprint(f"阈值解析失败: {e}")
+        sys.exit(1)
+    if bark_key is None:
+        bark_key = os.environ.get("BARK_KEY")  # 可能来自 ~/.glm-quota.env
+    api_key = load_api_key(api_key)
+
+    try:
+        data = fetch_quota(api_key)
+    except Exception as e:
+        eprint(f"查询失败: {e}")
+        sys.exit(1)
+    if not data.get("success"):
+        eprint(f"API 返回失败: {data.get('msg')}")
+        sys.exit(1)
+
+    if "--json" in args:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    if "--watch" in args:
+        watch(api_key, thresholds, bark_key, data=data)
+        return
+    print_report(parse_usage(data))
+
+
+if __name__ == "__main__":
+    main()
