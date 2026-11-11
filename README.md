@@ -2,6 +2,10 @@
 
 GLM Coding Plan（智谱 BigModel）配额查询 + 分档提醒工具。单文件 Python 脚本，零依赖，macOS 双通道推送（手机 Bark + Mac 通知中心）。
 
+| 终端查询 | 恢复推送 |
+| :---: | :---: |
+| ![终端查询](docs/terminal.png) | ![恢复推送](docs/notification.png) |
+
 ## 功能
 
 - **配额查询**：5小时额度 / 每周额度 / MCP 每月调用次数，带进度条和重置倒计时
